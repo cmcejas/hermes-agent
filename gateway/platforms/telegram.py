@@ -369,6 +369,19 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
 
     @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        """Read a boolean env var using common truthy/falsy strings."""
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "on", "y"}:
+            return True
+        if value in {"0", "false", "no", "off", "n"}:
+            return False
+        return bool(default)
+
+    @staticmethod
     def _env_float_clamped(
         name: str,
         default: float,
@@ -491,6 +504,25 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # Optional inbound message reaction lifecycle. Enabled for Carlos's
+        # Telegram bridge via HERMES_TELEGRAM_REACTIONS_ENABLED=1. Reactions are
+        # best-effort because Telegram chats may disable specific emoji.
+        self._reaction_lifecycle_enabled: bool = self._env_bool(
+            "HERMES_TELEGRAM_REACTIONS_ENABLED", False
+        )
+        self._reaction_stage_1_delay_seconds: float = self._env_float_clamped(
+            "HERMES_TELEGRAM_REACTION_STAGE_1_DELAY_SECONDS",
+            4.0,
+            min_value=0.5,
+            max_value=60.0,
+        )
+        self._reaction_stage_2_delay_seconds: float = self._env_float_clamped(
+            "HERMES_TELEGRAM_REACTION_STAGE_2_DELAY_SECONDS",
+            25.0,
+            min_value=self._reaction_stage_1_delay_seconds,
+            max_value=300.0,
+        )
+        self._reaction_tasks: Dict[tuple, asyncio.Task] = {}
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -558,6 +590,76 @@ class TelegramAdapter(BasePlatformAdapter):
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
+
+    def _is_user_authorized_from_message(self, message: Message) -> bool:
+        """Check if the sender of a Telegram message is authorized.
+
+        Priority:
+        1. Adapter-level ``allow_from`` config (when set, takes full precedence).
+        2. Runner-level ``_is_user_authorized`` callback (handles GATEWAY_ALLOW_ALL_USERS).
+        3. ``TELEGRAM_ALLOWED_USERS`` env var (global gateway-level allowlist).
+        """
+        user_id = str(getattr(getattr(message, "from_user", None), "id", "")).strip()
+        if not user_id:
+            # No sender (e.g. channel posts, system messages): skip user-level
+            # auth.  Chat-level authorization is enforced separately by the
+            # gateway runner's _is_user_authorized(source) check.
+            return True
+
+        # 1. Adapter-level allow_from: when set, it is the sole authority.
+        adapter_allow_from = self.config.extra.get("allow_from")
+        if adapter_allow_from is not None:
+            allowed = {str(u).strip() for u in adapter_allow_from if str(u).strip()}
+            return user_id in allowed or "*" in allowed
+
+        # 2. Adapter-level callback auth (used by tests and custom setups).
+        callback_auth = getattr(self, "_is_callback_user_authorized", None)
+        if callable(callback_auth):
+            try:
+                return bool(callback_auth(user_id))
+            except Exception:
+                pass
+
+        # 3. Runner-level auth callback (handles GATEWAY_ALLOW_ALL_USERS).
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                from gateway.session import SessionSource
+
+                chat_obj = getattr(message, "chat", None)
+                chat_id = str(getattr(chat_obj, "id", "")).strip()
+                chat_type_raw = str(getattr(chat_obj, "type", "dm")).strip().lower()
+                if chat_type_raw == "private":
+                    chat_type_raw = "dm"
+                elif chat_type_raw == "supergroup":
+                    thread_id = getattr(message, "message_thread_id", None)
+                    chat_type_raw = "forum" if thread_id is not None else "group"
+                user_name = str(getattr(getattr(message, "from_user", None), "username", "") or "").strip() or None
+                thread_id = str(getattr(message, "message_thread_id", "") or "").strip() or None
+
+                source = SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id=chat_id or user_id,
+                    chat_type=chat_type_raw,
+                    user_id=user_id,
+                    user_name=user_name,
+                    thread_id=thread_id,
+                )
+                return bool(auth_fn(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back to env-only auth for user %s",
+                    user_id,
+                    exc_info=True,
+                )
+
+        # 4. TELEGRAM_ALLOWED_USERS env var (global gateway-level allowlist).
+        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        if not allowed_csv:
+            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or user_id in allowed_ids
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -5070,7 +5172,8 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
-        DMs remain unrestricted. Group/supergroup messages are accepted when:
+        DMs from unauthorized users are always rejected. Group/supergroup
+        messages are accepted when:
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
         - the chat is explicitly allowlisted in ``free_response_chats``
@@ -5194,6 +5297,19 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+
+        # Early user-level auth check: reject unauthorized users before any
+        # text batching, event building, or response generation. This prevents
+        # removed/blocked users from injecting prompts into the agent.
+        if not self._is_user_authorized_from_message(msg):
+            user_id = getattr(getattr(msg, "from_user", None), "id", None)
+            chat_id = getattr(getattr(msg, "chat", None), "id", None)
+            logger.warning(
+                "[Telegram] Blocked unauthorized user %s in chat %s",
+                user_id, chat_id,
+            )
+            return
+
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
@@ -5208,6 +5324,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg, is_command=True):
             return
+
+        if not self._is_user_authorized_from_message(msg):
+            user_id = getattr(getattr(msg, "from_user", None), "id", None)
+            chat_id = getattr(getattr(msg, "chat", None), "id", None)
+            logger.warning(
+                "[Telegram] Blocked unauthorized user %s in chat %s",
+                user_id, chat_id,
+            )
+            return
+
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
@@ -5223,6 +5349,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
+            return
+
+        if not self._is_user_authorized_from_message(msg):
+            user_id = getattr(getattr(msg, "from_user", None), "id", None)
+            chat_id = getattr(getattr(msg, "chat", None), "id", None)
+            logger.warning(
+                "[Telegram] Blocked unauthorized user %s in chat %s",
+                user_id, chat_id,
+            )
             return
 
         venue = getattr(msg, "venue", None)
@@ -6004,8 +6139,12 @@ class TelegramAdapter(BasePlatformAdapter):
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        """Check if Telegram message reactions are enabled via config/env."""
+        if getattr(self, "_reaction_lifecycle_enabled", None) is not None:
+            return bool(self._reaction_lifecycle_enabled)
+        # Backward-compatible test/ops env var plus the newer namespaced one.
+        raw = os.getenv("HERMES_TELEGRAM_REACTIONS_ENABLED", os.getenv("TELEGRAM_REACTIONS", "false"))
+        return str(raw).strip().lower() not in {"false", "0", "no", "off", ""}
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -6023,13 +6162,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
-        """Clear all reactions from a Telegram message.
-
-        Calling ``set_message_reaction`` with ``reaction=None`` (or an empty
-        sequence) is the documented Bot API way to remove all bot-set
-        reactions on a message — equivalent to Bot API 10.0's
-        ``deleteMessageReaction`` but supported in PTB 22.6 already.
-        """
+        """Clear all reactions from a Telegram message."""
         if not self._bot:
             return False
         try:
@@ -6043,39 +6176,87 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
+    def _reaction_event_ids(self, event: MessageEvent) -> tuple[Optional[str], Optional[str]]:
+        source = getattr(event, "source", None)
+        return getattr(source, "chat_id", None), getattr(event, "message_id", None)
+
+    def _reaction_task_map(self) -> Dict[tuple, asyncio.Task]:
+        if not hasattr(self, "_reaction_tasks"):
+            self._reaction_tasks = {}
+        return self._reaction_tasks
+
+    def _reaction_task_key(self, chat_id: str, message_id: str) -> tuple:
+        return (str(chat_id), str(message_id))
+
+    def _cancel_reaction_task_by_ids(self, chat_id: str, message_id: str) -> None:
+        task = self._reaction_task_map().pop(self._reaction_task_key(chat_id, message_id), None)
+        if task is not None:
+            task.cancel()
+
+    async def _delayed_set_reaction(
+        self,
+        chat_id: str,
+        message_id: str,
+        delay: float,
+        emoji: str,
+    ) -> None:
+        await asyncio.sleep(delay)
+        await self._set_reaction(chat_id, message_id, emoji)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
+        """React when Telegram processing begins, then split long thinking into stages."""
         if not self._reactions_enabled():
             return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
-
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction.
-
-        Unlike Discord (additive reactions), Telegram's set_message_reaction
-        replaces all existing reactions in one call — no remove step needed.
-
-        On CANCELLED outcomes (e.g. the user runs ``/stop``, or a session is
-        interrupted mid-flight), we explicitly clear the 👀 in-progress
-        reaction so it doesn't linger on the user's message indefinitely.
-        Without this clear, the only way to remove the 👀 was to wait for
-        another agent run to swap it to 👍/👎 — which never happens if the
-        cancellation was the last activity in the chat.
-        """
-        if not self._reactions_enabled():
-            return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
+        chat_id, message_id = self._reaction_event_ids(event)
         if not (chat_id and message_id):
             return
+        self._cancel_reaction_task_by_ids(chat_id, message_id)
+        await self._set_reaction(chat_id, message_id, "\U0001f440")  # saw it: 👀
+
+        stage_1 = getattr(self, "_reaction_stage_1_delay_seconds", 4.0)
+        stage_2 = getattr(self, "_reaction_stage_2_delay_seconds", 25.0)
+
+        async def _long_running_lifecycle() -> None:
+            try:
+                await self._delayed_set_reaction(chat_id, message_id, stage_1, "\U0001f914")  # 🤔
+                await self._delayed_set_reaction(
+                    chat_id,
+                    message_id,
+                    max(0.0, stage_2 - stage_1),
+                    "\U0001f9e0",  # 🧠
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("[%s] Telegram reaction lifecycle failed", self.name, exc_info=True)
+
+        self._reaction_task_map()[self._reaction_task_key(chat_id, message_id)] = asyncio.create_task(
+            _long_running_lifecycle()
+        )
+
+    async def on_response_ready(self, event: MessageEvent) -> None:
+        """Swap to ready-to-send reaction after the agent finishes thinking."""
+        if not self._reactions_enabled():
+            return
+        chat_id, message_id = self._reaction_event_ids(event)
+        if not (chat_id and message_id):
+            return
+        self._cancel_reaction_task_by_ids(chat_id, message_id)
+        await self._set_reaction(chat_id, message_id, "\u270d\ufe0f")  # ✍️
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap the ready/in-progress reaction for final success/failure."""
+        if not self._reactions_enabled():
+            return
+        chat_id, message_id = self._reaction_event_ids(event)
+        if not (chat_id and message_id):
+            return
+        self._cancel_reaction_task_by_ids(chat_id, message_id)
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
         else:
             await self._set_reaction(
                 chat_id,
                 message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
+                "\u2705" if outcome == ProcessingOutcome.SUCCESS else "\u274c",
             )
